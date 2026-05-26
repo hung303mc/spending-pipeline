@@ -2,22 +2,26 @@
 Spending pipeline — chạy hàng tháng, fetch giao dịch từ Gmail (VCB + TPBank),
 parse sao kê TPBank TKTT PDF, categorize, upload Google Sheet, gửi email.
 
+MODES:
+    preliminary  (default): full pipeline + detect ambiguous + Telegram ask + PRELIM email
+    final                 : re-run with updated overrides + FINAL email + clear Pending tab
+
 USAGE (local):
-    python spending_pipeline.py                          # auto-detect previous month
-    python spending_pipeline.py --month 2026-04
+    python spending_pipeline.py                          # auto previous month, prelim
+    python spending_pipeline.py --mode final
     python spending_pipeline.py --month 2026-04 --include-quarter
 
-USAGE (cloud routine — env vars):
-    TOKEN_JSON      = nội dung token.json (JSON string)
-    CREDS_JSON      = nội dung credentials.json (JSON string, để refresh token)
-    SHEET_ID        = ID Google Sheet master
-    NOTIFY_EMAIL    = email gửi summary tới
-    OVERRIDES_JSON  = (optional) JSON overrides per txn_id
+USAGE (cloud — env vars):
+    TOKEN_JSON      = nội dung token.json
+    SHEET_ID        = Google Sheet master ID
+    NOTIFY_EMAILS   = "to1@gmail.com,to2@gmail.com" (comma-sep)
+    OVERRIDES_JSON  = (optional) overrides per txn_id
+    TELEGRAM_TOKEN  = bot token
+    TELEGRAM_CHAT_ID = chat ID
 
-NOTES:
-    - Token combined scope: gmail.readonly + gmail.send + sheets + drive.
-    - Master sheet thêm tab `Raw 2026-MM` mỗi tháng.
-    - Đầu quý (mùng 5 Jan/Apr/Jul/Oct) thêm tab `Quarter Qx-YYYY`.
+AMBIGUOUS DETECTION:
+    category == "Khác / Chuyển khoản cá nhân" AND amount >= 2M VND
+    → list in Telegram + sheet tab "Pending YYYY-MM" + PRELIM email note
 """
 import argparse
 import base64
@@ -44,6 +48,7 @@ from googleapiclient.discovery import build
 
 import pdfplumber
 import pypdf
+import requests
 from bs4 import BeautifulSoup  # for HTML email body
 
 HERE = Path(__file__).parent
@@ -57,6 +62,8 @@ SCOPES = [
 ]
 DEFAULT_USD_VND = 26000
 TPBANK_CARDS = {"7606": "Visa Platinum", "8272": "JCB Cashback"}
+AMBIGUOUS_CATEGORY = "Khác / Chuyển khoản cá nhân"
+AMBIGUOUS_MIN_VND = 2_000_000
 
 
 # ---------------- Auth ----------------
@@ -137,14 +144,37 @@ def gmail_get_attachment(gmail, mid, aid):
     return b64url_decode(att["data"])
 
 
-def gmail_send(gmail, to, subject, html_body, text_body):
+def gmail_send(gmail, to_list, subject, html_body, text_body):
+    """to_list: list of email addresses (first = To, rest = Cc)."""
+    if isinstance(to_list, str):
+        to_list = [to_list]
     msg = MIMEMultipart("alternative")
-    msg["to"] = to
+    msg["to"] = to_list[0]
+    if len(to_list) > 1:
+        msg["cc"] = ", ".join(to_list[1:])
     msg["subject"] = subject
     msg.attach(MIMEText(text_body, "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     gmail.users().messages().send(userId="me", body={"raw": raw}).execute()
+
+
+# ---------------- Telegram ----------------
+def telegram_send(text, parse_mode="HTML"):
+    """Send Telegram message. Returns message_id."""
+    token = os.environ.get("TELEGRAM_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print("  Telegram skipped (no TELEGRAM_TOKEN/CHAT_ID env)")
+        return None
+    r = requests.post(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data={"chat_id": chat_id, "text": text, "parse_mode": parse_mode,
+              "disable_web_page_preview": "true"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json()["result"]["message_id"]
 
 
 # ---------------- Date helpers ----------------
@@ -168,29 +198,36 @@ def gmail_range_q(start, end):
 
 # ---------------- Parsers ----------------
 def parse_vcb_transfer(text, msg_date):
-    """Parse 1 VCB Digibank chuyển khoản email."""
-    g = lambda p: (re.search(p, text, re.I | re.S) or [None, None])[1] if re.search(p, text, re.I | re.S) else None
-    amount = g(r"Số tiền[^\d]*?([\d,\.]+)\s*VND")
-    if not amount: return None
-    amount = int(amount.replace(",", "").replace(".", ""))
+    """Parse 1 VCB Digibank chuyển khoản email.
+
+    Body has bilingual labels: "Tên người hưởng\nBeneficiary Name\n<VALUE>".
+    Anchor on English label (more reliable separator).
+    """
+    def grab(label):
+        m = re.search(rf"{label}\s*\n+([^\n]+)", text)
+        return m.group(1).strip() if m else ""
+
+    amt_m = re.search(r"([\d,\.]+)\s*VND", text)
+    if not amt_m: return None
+    amount = int(amt_m.group(1).replace(",", "").replace(".", ""))
+
     time_m = re.search(r"(\d{2}:\d{2})\s+\S+\s+(\d{2}/\d{2}/\d{4})", text)
     if time_m:
-        t, d = time_m.group(1), time_m.group(2)
-        dd, mm, yy = d.split("/")
+        t = time_m.group(1)
+        dd, mm, yy = time_m.group(2).split("/")
         iso_date = f"{yy}-{mm}-{dd}"
     else:
         t, iso_date = "", msg_date
-    recipient = g(r"Tên người hưởng[^\n]*?\n([^\n]+)") or g(r"Beneficiary[^\n]*?\n([^\n]+)")
-    bank = g(r"Ngân hàng hưởng[^\n]*?\n([^\n]+)") or g(r"Beneficiary Bank[^\n]*?\n([^\n]+)")
-    content = g(r"Nội dung[^\n]*?\n([^\n]+)") or g(r"Content[^\n]*?\n([^\n]+)") or ""
-    order = g(r"Order Number[^\d]*(\d+)") or g(r"Số lệnh giao dịch[^\d]*(\d+)")
+
+    recipient = grab("Beneficiary Name")
+    bank = grab("Beneficiary Bank")
+    content = grab("Content")
+    order_m = re.search(r"Order Number[^\d]*(\d+)", text) or re.search(r"(\d{10,14})", text)
     return {
         "source": "VCB_TRANSFER", "date": iso_date, "time": t,
         "amount_vnd": amount,
-        "recipient": (recipient or "").strip(),
-        "bank": (bank or "").strip(),
-        "content": content.strip(),
-        "order_number": order or "",
+        "recipient": recipient, "bank": bank, "content": content,
+        "order_number": order_m.group(1) if order_m else "",
     }
 
 
@@ -520,6 +557,45 @@ def write_summary_tab(sheets, sheet_id, year, month, rows):
     return tab, total, cat_rows, src
 
 
+def write_pending_tab(sheets, sheet_id, year, month, ambiguous_rows, tg_msg_id=None):
+    """Write tab `Pending YYYY-MM` with ambiguous transactions."""
+    tab = f"Pending {year}-{month:02d}"
+    vals = [["#", "Date", "Source", "Amount VND", "Merchant", "Note", "txn_id", "Current Category", "Status"]]
+    for i, r in enumerate(ambiguous_rows, 1):
+        vals.append([i, r["date"], r["source"], r["amount_vnd"], r["merchant"], r["note"],
+                     r["raw"].get("txn_id", ""), r["category"], "PENDING"])
+    if tg_msg_id:
+        vals.append([])
+        vals.append(["telegram_msg_id", tg_msg_id])
+    vals.append([])
+    vals.append(["timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+
+    meta = sheets.spreadsheets().get(spreadsheetId=sheet_id).execute()
+    existing = {s["properties"]["title"]: s["properties"]["sheetId"] for s in meta["sheets"]}
+    if tab not in existing:
+        sheets.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body={
+            "requests": [{"addSheet": {"properties": {"title": tab}}}]
+        }).execute()
+    sheets.spreadsheets().values().clear(spreadsheetId=sheet_id, range=f"{tab}!A:Z").execute()
+    sheets.spreadsheets().values().update(
+        spreadsheetId=sheet_id, range=f"{tab}!A1",
+        valueInputOption="USER_ENTERED", body={"values": vals}
+    ).execute()
+    print(f"  Pending tab updated: {tab} ({len(ambiguous_rows)} ambiguous)")
+    return tab
+
+
+def detect_ambiguous(rows):
+    """Return rows with category==Khác AND amount >= AMBIGUOUS_MIN_VND, not excluded."""
+    return sorted(
+        [r for r in rows
+         if r["category"] == AMBIGUOUS_CATEGORY
+         and r["amount_vnd"] >= AMBIGUOUS_MIN_VND
+         and not r["exclude_from_spending"]],
+        key=lambda r: -r["amount_vnd"]
+    )
+
+
 def write_quarter_tab(sheets, sheet_id, year, quarter, all_rows_by_month):
     """all_rows_by_month: {(y,m): [rows]} for 3 months of quarter."""
     tab = f"Quarter Q{quarter}-{year}"
@@ -570,7 +646,8 @@ def write_quarter_tab(sheets, sheet_id, year, quarter, all_rows_by_month):
 
 
 # ---------------- Email ----------------
-def build_email_html(year, month, total, cat_rows, src, sheet_url, quarter_info=None):
+def build_email_html(year, month, total, cat_rows, src, sheet_url, quarter_info=None,
+                     ambiguous_rows=None, mode="final"):
     cat_html = "\n".join(
         f"<tr><td>{c}</td><td align=right>{n}</td><td align=right>{t:,}</td><td align=right>{t/total*100:.1f}%</td></tr>"
         for c, n, t in cat_rows[:15]
@@ -592,10 +669,25 @@ def build_email_html(year, month, total, cat_rows, src, sheet_url, quarter_info=
         <h3>Top 10 Category (Quarter)</h3>
         <table border=1 cellpadding=5><tr><th>Category</th><th>#</th><th>Total</th></tr>{qc_html}</table>
         """
+    amb_html = ""
+    if ambiguous_rows:
+        amb_rows_html = "\n".join(
+            f"<tr><td>{i}</td><td>{r['date']}</td><td align=right>{r['amount_vnd']:,}</td><td>{r['merchant']}</td></tr>"
+            for i, r in enumerate(ambiguous_rows, 1)
+        )
+        amb_html = f"""
+        <div style="background:#fff8e1;padding:15px;border-left:4px solid #ff9800;margin:15px 0">
+        <h3>⏳ {len(ambiguous_rows)} giao dịch cần clarify</h3>
+        <p>Tao đã gửi Telegram hỏi chi tiết. Mày reply Telegram → tao sẽ update sheet + gửi mail FINAL với category đúng.</p>
+        <table border=1 cellpadding=5><tr><th>#</th><th>Date</th><th>Amount VND</th><th>Merchant</th></tr>{amb_rows_html}</table>
+        </div>
+        """
+    title = "💸 Báo cáo chi tiêu (PRELIMINARY)" if mode == "preliminary" else "💸 Báo cáo chi tiêu (FINAL)"
     return f"""<html><body style="font-family:Arial,sans-serif">
-    <h1>💸 Báo cáo chi tiêu {month:02d}/{year}</h1>
+    <h1>{title} — {month:02d}/{year}</h1>
     <p><b>Tổng chi tiêu: {total:,} VND</b></p>
     <p>📊 <a href="{sheet_url}">Mở Google Sheet đầy đủ</a></p>
+    {amb_html}
 
     <h2>Phân bổ theo nguồn</h2>
     <table border=1 cellpadding=5><tr><th>Nguồn</th><th>Số GD</th><th>Total VND</th></tr>{src_html}</table>
@@ -614,9 +706,12 @@ def build_email_html(year, month, total, cat_rows, src, sheet_url, quarter_info=
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--month", help="YYYY-MM (default: previous month)")
+    ap.add_argument("--mode", choices=["preliminary", "final"], default="preliminary",
+                    help="preliminary = first run, detect ambiguous + Telegram ask + PRELIM email; final = after user reply, send FINAL email")
     ap.add_argument("--include-quarter", action="store_true", help="Force quarterly report")
-    ap.add_argument("--auto-quarter", action="store_true", help="Auto-detect: if running on month=Jan/Apr/Jul/Oct → include quarter of prev 3 months")
+    ap.add_argument("--auto-quarter", action="store_true", help="Auto-detect end-of-quarter")
     ap.add_argument("--no-email", action="store_true", help="Skip sending email")
+    ap.add_argument("--no-telegram", action="store_true", help="Skip Telegram")
     ap.add_argument("--overrides", help="Path to overrides JSON file")
     args = ap.parse_args()
 
@@ -632,14 +727,17 @@ def main():
     sheets = svc("sheets", "v4", creds)
 
     sheet_id = os.environ.get("SHEET_ID", "1tnwApdgGLF1qG_b_lIclO78hJHGo6ZUtXmpnKYrKb8A")
-    notify_email = os.environ.get("NOTIFY_EMAIL", "hung216mc@gmail.com")
+    notify_emails_str = os.environ.get("NOTIFY_EMAILS", "hung216mc@gmail.com,duongngoccongkhanh@gmail.com")
+    notify_emails = [e.strip() for e in notify_emails_str.split(",") if e.strip()]
     overrides = {}
+    # Layer 1: default file in repo
+    if (HERE / "overrides.json").exists():
+        overrides.update(json.loads((HERE / "overrides.json").read_text(encoding="utf-8")))
+    # Layer 2: runtime additions (CLI > env)
     if args.overrides:
-        overrides = json.loads(Path(args.overrides).read_text(encoding="utf-8"))
+        overrides.update(json.loads(Path(args.overrides).read_text(encoding="utf-8")))
     elif os.environ.get("OVERRIDES_JSON"):
-        overrides = json.loads(os.environ["OVERRIDES_JSON"])
-    elif (HERE / "overrides.json").exists():
-        overrides = json.loads((HERE / "overrides.json").read_text(encoding="utf-8"))
+        overrides.update(json.loads(os.environ["OVERRIDES_JSON"]))
 
     # Fetch + upload current month
     rows = fetch_month(gmail, y, m, overrides)
@@ -664,18 +762,60 @@ def main():
                 write_summary_tab(sheets, sheet_id, y, qm, all_q[(y, qm)])
         quarter_info = write_quarter_tab(sheets, sheet_id, y, q, all_q)
 
-    # Email
+    # Detect ambiguous (only spending rows where category is "Khác" and amount large)
+    ambiguous = detect_ambiguous(rows)
+    if ambiguous:
+        print(f"\nAmbiguous ({len(ambiguous)}):")
+        for r in ambiguous:
+            print(f"  {r['date']} | {r['amount_vnd']:>12,} | {r['merchant'][:60]} | src={r['source']}")
     sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
-    if not args.no_email:
-        subject = f"💸 Chi tiêu {m:02d}/{y}: {total:,} VND"
-        if quarter_info:
-            subject += f" + Quarter Q{(m-1)//3+1} report"
-        html = build_email_html(y, m, total, cat_rows, src, sheet_url, quarter_info)
-        text = f"Chi tiêu {m:02d}/{y}: {total:,} VND\nSheet: {sheet_url}"
-        gmail_send(gmail, notify_email, subject, html, text)
-        print(f"Email sent → {notify_email}")
 
-    print(f"\n✅ DONE — Total: {total:,} VND\n   Sheet: {sheet_url}")
+    # Preliminary mode + has ambiguous → Telegram + Pending tab
+    tg_msg_id = None
+    if args.mode == "preliminary" and ambiguous and not args.no_telegram:
+        lines = [f"💸 <b>Chi tiêu {m:02d}/{y}: {total:,} VND</b>",
+                 f"📊 <a href='{sheet_url}'>Sheet</a>",
+                 "",
+                 f"⏳ <b>{len(ambiguous)} giao dịch cần clarify</b> (Khác + ≥2M):",
+                 ""]
+        for i, r in enumerate(ambiguous, 1):
+            mer = r["merchant"][:50]
+            lines.append(f"<b>{i}.</b> {r['date']} — <b>{r['amount_vnd']:,}</b> VND")
+            lines.append(f"   <code>{mer}</code>")
+        lines.append("")
+        lines.append("👉 <i>Reply tin nhắn này, tao tự hiểu (vd: '1 tiền nhà, 2 cho mẹ đi SG'). Sau khi rep, mai/2 hôm sau tao auto update email FINAL.</i>")
+        tg_msg_id = telegram_send("\n".join(lines))
+        print(f"Telegram sent (msg_id={tg_msg_id})")
+        write_pending_tab(sheets, sheet_id, y, m, ambiguous, tg_msg_id)
+    elif args.mode == "final":
+        # Clear pending tab status
+        try:
+            tab = f"Pending {y}-{m:02d}"
+            sheets.spreadsheets().values().clear(spreadsheetId=sheet_id, range=f"{tab}!A:Z").execute()
+            sheets.spreadsheets().values().update(
+                spreadsheetId=sheet_id, range=f"{tab}!A1", valueInputOption="USER_ENTERED",
+                body={"values": [["RESOLVED", datetime.now().strftime("%Y-%m-%d %H:%M:%S")]]}
+            ).execute()
+            print(f"Cleared pending tab")
+        except Exception as e:
+            print(f"  (no pending tab to clear: {e})")
+
+    # Email
+    if not args.no_email:
+        mode_tag = "PRELIM" if args.mode == "preliminary" and ambiguous else "FINAL"
+        subject = f"💸 [{mode_tag}] Chi tiêu {m:02d}/{y}: {total:,} VND"
+        if quarter_info:
+            subject += f" + Q{(m-1)//3+1}"
+        html = build_email_html(y, m, total, cat_rows, src, sheet_url, quarter_info,
+                                ambiguous_rows=ambiguous if mode_tag == "PRELIM" else None,
+                                mode="preliminary" if mode_tag == "PRELIM" else "final")
+        text = f"[{mode_tag}] Chi tiêu {m:02d}/{y}: {total:,} VND\nSheet: {sheet_url}"
+        if mode_tag == "PRELIM":
+            text += f"\n\nCòn {len(ambiguous)} GD chờ clarify. Check Telegram."
+        gmail_send(gmail, notify_emails, subject, html, text)
+        print(f"Email sent → {notify_emails}")
+
+    print(f"\n✅ DONE [{args.mode}] — Total: {total:,} VND, Ambiguous: {len(ambiguous)}\n   Sheet: {sheet_url}")
 
 
 if __name__ == "__main__":

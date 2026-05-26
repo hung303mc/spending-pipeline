@@ -1,0 +1,27 @@
+{
+  "203V009260972957": {
+    "category": "Chuyển nội bộ (loại)",
+    "user_note": "CK nội bộ sang VCB",
+    "exclude": true
+  },
+  "203V600260931505": {
+    "category": "Phí nhà / chung cư",
+    "user_note": "CK tiền nhà"
+  },
+  "203V600260977377": {
+    "category": "Vé giải trí / Du lịch",
+    "user_note": "Tour Singapore cho mẹ"
+  },
+  "203V600261102235": {
+    "category": "Đồ gia dụng / Điện tử",
+    "user_note": "Máy lọc không khí"
+  },
+  "203V60026110A13Z": {
+    "category": "Project cá nhân (Cloud/Hosting)",
+    "user_note": "Topup CloudZone VPS (OpenClaw)"
+  },
+  "203V600261125974": {
+    "category": "Đồ gia dụng / Điện tử",
+    "user_note": "iMac Mini"
+  }
+}

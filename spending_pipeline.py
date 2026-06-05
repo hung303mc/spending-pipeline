@@ -507,53 +507,327 @@ def upload_month_tab(sheets, sheet_id, rows, year, month):
     return tab_name
 
 
+def read_prev_summary_categories(sheets, sheet_id, year, month):
+    """Read previous month's Summary tab → dict {category: total_vnd}. Returns {} if not found."""
+    prev_y, prev_m = (year, month - 1) if month > 1 else (year - 1, 12)
+    tab = f"Summary {prev_y}-{prev_m:02d}"
+    try:
+        meta = sheets.spreadsheets().get(spreadsheetId=sheet_id).execute()
+        if tab not in {s["properties"]["title"] for s in meta["sheets"]}:
+            return {}, None
+        vals = sheets.spreadsheets().values().get(
+            spreadsheetId=sheet_id, range=f"{tab}!A1:F300"
+        ).execute().get("values", [])
+    except Exception:
+        return {}, None
+    result = {}
+    prev_total = None
+    in_cat = False
+    for row in vals:
+        if not row:
+            if in_cat:
+                in_cat = False
+            continue
+        cell0 = (row[0] or "").strip() if row else ""
+        if cell0 == "TỔNG" and len(row) >= 2:
+            try:
+                prev_total = int(str(row[1]).replace(",", "").strip())
+            except (ValueError, AttributeError):
+                pass
+        if cell0.startswith("BY CATEGORY"):
+            in_cat = True
+            continue
+        if in_cat and len(row) >= 3 and cell0 and cell0 != "Category":
+            try:
+                cat_name = cell0
+                total = int(str(row[2]).replace(",", "").strip())
+                result[cat_name] = total
+            except (ValueError, IndexError, AttributeError):
+                pass
+    return result, prev_total
+
+
+def _fmt_delta(delta):
+    """Return (arrow_str, color_rgb) for a VND delta. Spending up = red, down = green."""
+    if delta is None:
+        return "", None
+    if delta > 0:
+        return f"▲ +{delta:,}", (0.85, 0.20, 0.20)  # red
+    if delta < 0:
+        return f"▼ {delta:,}", (0.15, 0.65, 0.30)  # green
+    return "= 0", (0.5, 0.5, 0.5)
+
+
+def _fmt_pct_delta(curr, prev):
+    if not prev:
+        return "", None
+    pct = (curr - prev) / prev * 100
+    if pct > 0:
+        return f"+{pct:.1f}%", (0.85, 0.20, 0.20)
+    if pct < 0:
+        return f"{pct:.1f}%", (0.15, 0.65, 0.30)
+    return "0%", (0.5, 0.5, 0.5)
+
+
 def write_summary_tab(sheets, sheet_id, year, month, rows):
-    """Write/replace Summary YYYY-MM tab."""
+    """Write/replace Summary YYYY-MM tab with formatting + MoM + collapsible groups."""
     tab = f"Summary {year}-{month:02d}"
     spending = [r for r in rows if not r["exclude_from_spending"]]
     excluded = [r for r in rows if r["exclude_from_spending"]]
     total = sum(r["amount_vnd"] for r in spending)
     excl_total = sum(r["amount_vnd"] for r in excluded)
+    days_in_month = calendar.monthrange(year, month)[1]
 
-    cat = defaultdict(lambda: {"count":0,"total":0})
+    cat = defaultdict(lambda: {"count": 0, "total": 0, "rows": []})
     for r in spending:
-        c = cat[r["category"]]; c["count"] += 1; c["total"] += r["amount_vnd"]
-    cat_rows = sorted([(k,v["count"],v["total"]) for k,v in cat.items()], key=lambda x: -x[2])
+        c = cat[r["category"]]
+        c["count"] += 1
+        c["total"] += r["amount_vnd"]
+        c["rows"].append(r)
+    cat_rows = sorted([(k, v["count"], v["total"]) for k, v in cat.items()], key=lambda x: -x[2])
 
-    src = defaultdict(lambda: {"count":0,"total":0})
+    src = defaultdict(lambda: {"count": 0, "total": 0})
     for r in spending:
-        s = src[r["source"]]; s["count"] += 1; s["total"] += r["amount_vnd"]
+        s = src[r["source"]]
+        s["count"] += 1
+        s["total"] += r["amount_vnd"]
 
-    vals = [
-        [f"CHI TIÊU THÁNG {month:02d}/{year}", "", "", ""],
-        ["", "", "", ""],
-        ["TỔNG (đã loại double-count)", f"{total:,} VND", "", ""],
-        ["Số giao dịch", str(len(spending)), "", ""],
-        ["Trung bình / ngày", f"{total // calendar.monthrange(year, month)[1]:,} VND", "", ""],
-        ["", "", "", ""],
-        ["LOẠI TRỪ", f"{excl_total:,} VND", f"{len(excluded)} GD", "(trả nợ CC / nội bộ)"],
-        ["", "", "", ""],
-        ["BY SOURCE", "Số GD", "Total VND", "%"],
-    ]
-    for s, v in sorted(src.items(), key=lambda x: -x[1]["total"]):
-        vals.append([s, v["count"], v["total"], f"{v['total']/total*100:.1f}%" if total else "0%"])
-    vals.append(["", "", "", ""])
-    vals.append(["BY CATEGORY", "Số GD", "Total VND", "%"])
+    prev_cats, prev_total = read_prev_summary_categories(sheets, sheet_id, year, month)
+
+    # ---------- Build values matrix ----------
+    vals = []
+    # Row 0: title
+    vals.append([f"💸 CHI TIÊU THÁNG {month:02d}/{year}", "", "", "", "", ""])
+    vals.append(["", "", "", "", "", ""])
+    # Stats with delta
+    total_delta = total - prev_total if prev_total else None
+    total_delta_str, _ = _fmt_delta(total_delta)
+    total_pct_str, _ = _fmt_pct_delta(total, prev_total) if prev_total else ("", None)
+    vals.append(["TỔNG", total, "VND", total_delta_str, total_pct_str, "vs tháng trước" if prev_total else ""])
+    vals.append(["Số giao dịch", len(spending), "GD", "", "", ""])
+    vals.append(["Trung bình / ngày", total // days_in_month if days_in_month else 0, "VND", "", "", ""])
+    vals.append(["", "", "", "", "", ""])
+    vals.append(["LOẠI TRỪ", excl_total, "VND", f"{len(excluded)} GD", "(trả nợ CC / nội bộ)", ""])
+    vals.append(["", "", "", "", "", ""])
+    # BY SOURCE
+    by_source_header_row = len(vals)
+    vals.append(["BY SOURCE", "Số GD", "Total VND", "%", "", ""])
+    src_sorted = sorted(src.items(), key=lambda x: -x[1]["total"])
+    for s, v in src_sorted:
+        pct = v["total"] / total * 100 if total else 0
+        vals.append([s, v["count"], v["total"], pct / 100, "", ""])
+    vals.append(["", "", "", "", "", ""])
+    # BY CATEGORY (with detail groups)
+    by_cat_header_row = len(vals)
+    vals.append(["BY CATEGORY (click ▶ bên trái để xem top 10 GD)", "Số GD", "Total VND", "%", "vs T-1", "%Δ"])
+    cat_group_ranges = []  # list of (start_row, end_row) 0-indexed for grouping
     for c, n, t in cat_rows:
-        vals.append([c, n, t, f"{t/total*100:.1f}%" if total else "0%"])
+        prev_t = prev_cats.get(c)
+        delta = t - prev_t if prev_t is not None else None
+        d_str, _ = _fmt_delta(delta)
+        pd_str, _ = _fmt_pct_delta(t, prev_t) if prev_t else ("", None)
+        pct = t / total if total else 0
+        cat_row_idx = len(vals)
+        vals.append([c, n, t, pct, d_str, pd_str])
+        # Top 10 GD trong category này
+        top10 = sorted(cat[c]["rows"], key=lambda r: -r["amount_vnd"])[:10]
+        group_start = len(vals)
+        for r in top10:
+            merchant = (r["merchant"] or "")[:60]
+            vals.append(["   " + r["date"], r["time"], r["amount_vnd"], merchant, r["source"], ""])
+        group_end = len(vals)  # exclusive
+        if group_end > group_start:
+            cat_group_ranges.append((group_start, group_end))
+    vals.append(["", "", "", "", "", ""])
+    # MoM Comparison (chỉ categories có cả 2 tháng hoặc xuất hiện ở 1 tháng)
+    mom_header_row = None
+    if prev_cats:
+        mom_header_row = len(vals)
+        vals.append(["📊 SO SÁNH VỚI THÁNG TRƯỚC", "T này", "T trước", "Δ VND", "%Δ", ""])
+        all_cats = set(prev_cats.keys()) | {c for c, _, _ in cat_rows}
+        curr_map = {c: t for c, _, t in cat_rows}
+        mom_data = []
+        for c in all_cats:
+            t_now = curr_map.get(c, 0)
+            t_prev = prev_cats.get(c, 0)
+            delta = t_now - t_prev
+            mom_data.append((c, t_now, t_prev, delta))
+        mom_data.sort(key=lambda x: -abs(x[3]))
+        for c, t_now, t_prev, delta in mom_data:
+            pct_str = ""
+            if t_prev:
+                pct = (t_now - t_prev) / t_prev * 100
+                pct_str = f"{'+' if pct > 0 else ''}{pct:.1f}%"
+            elif t_now:
+                pct_str = "NEW"
+            arrow = "▲" if delta > 0 else ("▼" if delta < 0 else "=")
+            vals.append([c, t_now, t_prev, f"{arrow} {delta:+,}", pct_str, ""])
+        vals.append(["", "", "", "", "", ""])
+    # RECOMMENDATION placeholder
+    reco_header_row = len(vals)
+    vals.append(["💡 RECOMMENDATION TIẾT KIỆM (AI sẽ điền)", "", "", "", "", ""])
+    for _ in range(8):  # 8 empty rows for AI to fill
+        vals.append(["", "", "", "", "", ""])
+    reco_end_row = len(vals)
 
+    # ---------- Create/clear tab ----------
     meta = sheets.spreadsheets().get(spreadsheetId=sheet_id).execute()
     existing = {s["properties"]["title"]: s["properties"]["sheetId"] for s in meta["sheets"]}
     if tab not in existing:
         sheets.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body={
             "requests": [{"addSheet": {"properties": {"title": tab}}}]
         }).execute()
+        meta = sheets.spreadsheets().get(spreadsheetId=sheet_id).execute()
+        existing = {s["properties"]["title"]: s["properties"]["sheetId"] for s in meta["sheets"]}
+    gid = existing[tab]
+
+    # Remove old dimension groups (idempotent re-run)
+    try:
+        meta_full = sheets.spreadsheets().get(spreadsheetId=sheet_id, includeGridData=False).execute()
+        for s in meta_full["sheets"]:
+            if s["properties"]["sheetId"] == gid:
+                for g in s.get("rowGroups", []):
+                    sheets.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body={
+                        "requests": [{"deleteDimensionGroup": {"range": g["range"]}}]
+                    }).execute()
+                break
+    except Exception as e:
+        print(f"  (group cleanup skipped: {e})")
+
     sheets.spreadsheets().values().clear(spreadsheetId=sheet_id, range=f"{tab}!A:Z").execute()
     sheets.spreadsheets().values().update(
         spreadsheetId=sheet_id, range=f"{tab}!A1",
-        valueInputOption="USER_ENTERED", body={"values": vals}
+        valueInputOption="RAW", body={"values": vals}
     ).execute()
+
+    # ---------- Formatting requests ----------
+    requests = []
+    # Freeze top row + auto-resize cols
+    requests.append({"updateSheetProperties": {
+        "properties": {"sheetId": gid, "gridProperties": {"frozenRowCount": 1}},
+        "fields": "gridProperties.frozenRowCount"}})
+    # Title row: merge A1:F1, big bold white on dark teal bg
+    requests.append({"mergeCells": {
+        "range": {"sheetId": gid, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 6},
+        "mergeType": "MERGE_ALL"}})
+    requests.append({"repeatCell": {
+        "range": {"sheetId": gid, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 6},
+        "cell": {"userEnteredFormat": {
+            "backgroundColor": {"red": 0.15, "green": 0.35, "blue": 0.55},
+            "horizontalAlignment": "CENTER",
+            "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1}, "bold": True, "fontSize": 14}}},
+        "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,textFormat)"}})
+    # Stats rows 3-5: bold label, format VND cells
+    requests.append({"repeatCell": {
+        "range": {"sheetId": gid, "startRowIndex": 2, "endRowIndex": 5, "startColumnIndex": 0, "endColumnIndex": 1},
+        "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+        "fields": "userEnteredFormat.textFormat"}})
+    # Color the total delta cell
+    if total_delta is not None:
+        _, color = _fmt_delta(total_delta)
+        if color:
+            requests.append({"repeatCell": {
+                "range": {"sheetId": gid, "startRowIndex": 2, "endRowIndex": 3, "startColumnIndex": 3, "endColumnIndex": 5},
+                "cell": {"userEnteredFormat": {"textFormat": {"foregroundColor": {"red": color[0], "green": color[1], "blue": color[2]}, "bold": True}}},
+                "fields": "userEnteredFormat.textFormat"}})
+    # BY SOURCE header
+    requests.append({"repeatCell": {
+        "range": {"sheetId": gid, "startRowIndex": by_source_header_row, "endRowIndex": by_source_header_row + 1, "startColumnIndex": 0, "endColumnIndex": 6},
+        "cell": {"userEnteredFormat": {
+            "backgroundColor": {"red": 0.85, "green": 0.92, "blue": 0.98},
+            "textFormat": {"bold": True}}},
+        "fields": "userEnteredFormat(backgroundColor,textFormat)"}})
+    # BY CATEGORY header
+    requests.append({"repeatCell": {
+        "range": {"sheetId": gid, "startRowIndex": by_cat_header_row, "endRowIndex": by_cat_header_row + 1, "startColumnIndex": 0, "endColumnIndex": 6},
+        "cell": {"userEnteredFormat": {
+            "backgroundColor": {"red": 0.85, "green": 0.92, "blue": 0.98},
+            "textFormat": {"bold": True}}},
+        "fields": "userEnteredFormat(backgroundColor,textFormat)"}})
+    # MoM header
+    if mom_header_row is not None:
+        requests.append({"repeatCell": {
+            "range": {"sheetId": gid, "startRowIndex": mom_header_row, "endRowIndex": mom_header_row + 1, "startColumnIndex": 0, "endColumnIndex": 6},
+            "cell": {"userEnteredFormat": {
+                "backgroundColor": {"red": 0.95, "green": 0.95, "blue": 0.80},
+                "textFormat": {"bold": True}}},
+            "fields": "userEnteredFormat(backgroundColor,textFormat)"}})
+    # RECOMMENDATION header
+    requests.append({"repeatCell": {
+        "range": {"sheetId": gid, "startRowIndex": reco_header_row, "endRowIndex": reco_header_row + 1, "startColumnIndex": 0, "endColumnIndex": 6},
+        "cell": {"userEnteredFormat": {
+            "backgroundColor": {"red": 1.0, "green": 0.92, "blue": 0.70},
+            "textFormat": {"bold": True, "fontSize": 11}}},
+        "fields": "userEnteredFormat(backgroundColor,textFormat)"}})
+    # Number format for col B (count/amount) + col C (amount) + col D (mom delta)
+    # Col B as int with thousand sep
+    requests.append({"repeatCell": {
+        "range": {"sheetId": gid, "startRowIndex": 2, "endRowIndex": reco_end_row, "startColumnIndex": 1, "endColumnIndex": 2},
+        "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "#,##0"}}},
+        "fields": "userEnteredFormat.numberFormat"}})
+    # Col C as int VND
+    requests.append({"repeatCell": {
+        "range": {"sheetId": gid, "startRowIndex": 2, "endRowIndex": reco_end_row, "startColumnIndex": 2, "endColumnIndex": 3},
+        "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "#,##0"}}},
+        "fields": "userEnteredFormat.numberFormat"}})
+    # Col D as percent for source rows (rows are stored as 0..1) - apply only to source block
+    src_start = by_source_header_row + 1
+    src_end = src_start + len(src_sorted)
+    if src_end > src_start:
+        requests.append({"repeatCell": {
+            "range": {"sheetId": gid, "startRowIndex": src_start, "endRowIndex": src_end, "startColumnIndex": 3, "endColumnIndex": 4},
+            "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"}}},
+            "fields": "userEnteredFormat.numberFormat"}})
+    # Col D as percent for category rows (only the header + cat rows, NOT detail rows under)
+    # We apply per-cat-row individually
+    for c_idx, (c, n, t) in enumerate(cat_rows):
+        # Find this cat's row in vals (recompute since interleaved)
+        pass
+    # Simpler: apply percent format to col D for the whole BY CATEGORY block, detail rows have empty col D so no harm
+    cat_first = by_cat_header_row + 1
+    cat_last = cat_first
+    if cat_rows:
+        # rough: last cat row + 10 detail rows
+        # Calculate: by_cat_header_row + 1 + sum(cat + detail) for all cats
+        n_cats = len(cat_rows)
+        n_details = sum(min(10, len(cat[c]["rows"])) for c, _, _ in cat_rows)
+        cat_last = cat_first + n_cats + n_details
+        requests.append({"repeatCell": {
+            "range": {"sheetId": gid, "startRowIndex": cat_first, "endRowIndex": cat_last, "startColumnIndex": 3, "endColumnIndex": 4},
+            "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"}}},
+            "fields": "userEnteredFormat.numberFormat"}})
+    # Column widths
+    requests.append({"updateDimensionProperties": {
+        "range": {"sheetId": gid, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
+        "properties": {"pixelSize": 260},
+        "fields": "pixelSize"}})
+    requests.append({"updateDimensionProperties": {
+        "range": {"sheetId": gid, "dimension": "COLUMNS", "startIndex": 1, "endIndex": 6},
+        "properties": {"pixelSize": 130},
+        "fields": "pixelSize"}})
+    # Add dimension groups for each category's detail rows
+    for gstart, gend in cat_group_ranges:
+        requests.append({"addDimensionGroup": {
+            "range": {"sheetId": gid, "dimension": "ROWS", "startIndex": gstart, "endIndex": gend}}})
+
+    if requests:
+        sheets.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body={"requests": requests}).execute()
+
+    # Collapse all dimension groups after creation
+    if cat_group_ranges:
+        collapse_reqs = [{"updateDimensionGroup": {
+            "dimensionGroup": {
+                "range": {"sheetId": gid, "dimension": "ROWS", "startIndex": gs, "endIndex": ge},
+                "depth": 1, "collapsed": True},
+            "fields": "collapsed"}} for gs, ge in cat_group_ranges]
+        try:
+            sheets.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body={"requests": collapse_reqs}).execute()
+        except Exception as e:
+            print(f"  (collapse skipped: {e})")
+
+    reco_range = f"{tab}!A{reco_header_row + 2}:F{reco_end_row}"
     print(f"  Summary tab updated: {tab}")
+    print(f"  RECO_RANGE={reco_range}  (8 empty rows ready for AI recommendation)")
     return tab, total, cat_rows, src
 
 

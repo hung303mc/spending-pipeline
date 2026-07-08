@@ -516,10 +516,21 @@ def read_prev_summary_categories(sheets, sheet_id, year, month):
         if tab not in {s["properties"]["title"] for s in meta["sheets"]}:
             return {}, None
         vals = sheets.spreadsheets().values().get(
-            spreadsheetId=sheet_id, range=f"{tab}!A1:F300"
+            spreadsheetId=sheet_id,
+            range=f"{tab}!A1:F300",
+            valueRenderOption="UNFORMATTED_VALUE",
         ).execute().get("values", [])
     except Exception:
         return {}, None
+
+    def _to_int(x):
+        if isinstance(x, (int, float)):
+            return int(x)
+        s = str(x).strip()
+        # VN locale writes 74.578.066 (dot as thousand-sep), US writes 74,578,066
+        s = s.replace(",", "").replace(".", "").replace("\xa0", "").replace(" ", "")
+        return int(s)
+
     result = {}
     prev_total = None
     in_cat = False
@@ -531,7 +542,7 @@ def read_prev_summary_categories(sheets, sheet_id, year, month):
         cell0 = (row[0] or "").strip() if row else ""
         if cell0 == "TỔNG" and len(row) >= 2:
             try:
-                prev_total = int(str(row[1]).replace(",", "").strip())
+                prev_total = _to_int(row[1])
             except (ValueError, AttributeError):
                 pass
         if cell0.startswith("BY CATEGORY"):
@@ -539,9 +550,7 @@ def read_prev_summary_categories(sheets, sheet_id, year, month):
             continue
         if in_cat and len(row) >= 3 and cell0 and cell0 != "Category":
             try:
-                cat_name = cell0
-                total = int(str(row[2]).replace(",", "").strip())
-                result[cat_name] = total
+                result[cell0] = _to_int(row[2])
             except (ValueError, IndexError, AttributeError):
                 pass
     return result, prev_total

@@ -23,5 +23,10 @@
   "203V600261125974": {
     "category": "Đồ gia dụng / Điện tử",
     "user_note": "iMac Mini"
+  },
+  "203CTMB261970804": {
+    "category": "Trả nợ / Cho mượn",
+    "user_note": "Cho a Hưng mượn, đã trả lại",
+    "exclude": true
   }
 }

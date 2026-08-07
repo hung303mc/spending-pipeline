@@ -322,14 +322,18 @@ def parse_tpbank_tktt_pdf(pdf_bytes):
                 debit = float((row[5] or "0").replace(",", ""))
                 if debit <= 0: continue
                 descr = (row[4] or "").replace("\n", " ").strip()
-                is_cc = "TT QUA TPBANK EBANKING" in descr.upper()
+                descr_u = descr.upper()
+                is_cc = "TT QUA TPBANK EBANKING" in descr_u
+                is_savings = "TIET KIEM" in descr_u
+                exclude = is_cc or is_savings
+                reason = "Trả dư nợ thẻ tín dụng" if is_cc else ("Gửi tiết kiệm (nội bộ, không phải chi tiêu)" if is_savings else "")
                 rows.append({
                     "source": "TPBANK_TKTT", "date": iso, "time": "",
                     "amount_vnd": int(debit),
                     "merchant_raw": descr,
                     "txn_id": (row[3] or "").strip(),
-                    "exclude_from_spending": is_cc,
-                    "exclude_reason": "Trả dư nợ thẻ tín dụng" if is_cc else "",
+                    "exclude_from_spending": exclude,
+                    "exclude_reason": reason,
                 })
             except (ValueError, IndexError):
                 continue

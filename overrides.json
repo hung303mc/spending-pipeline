@@ -23,5 +23,15 @@
   "203V600261125974": {
     "category": "Đồ gia dụng / Điện tử",
     "user_note": "iMac Mini"
+  },
+  "203V009262520676": {
+    "category": "Cho mượn (loại)",
+    "user_note": "Cho mượn tiền 200tr",
+    "exclude": true
+  },
+  "203V501262640389": {
+    "category": "Cho mượn (loại)",
+    "user_note": "Cho mượn tiền 100tr",
+    "exclude": true
   }
 }

@@ -33,6 +33,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from email.mime.multipart import MIMEMultipart
@@ -45,6 +46,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 import pdfplumber
 import pypdf
@@ -135,12 +137,37 @@ def gmail_search(gmail, query, max_results=500):
     return ids
 
 
+def _is_rate_limit_error(err):
+    if not isinstance(err, HttpError) or err.resp.status not in (403, 429):
+        return False
+    reason = ""
+    try:
+        reason = err.error_details[0].get("reason", "")
+    except Exception:
+        reason = str(err)
+    return "rateLimitExceeded" in reason or "quotaExceeded" in reason or "rateLimitExceeded" in str(err) or "Quota exceeded" in str(err)
+
+
+def _with_retry(fn, max_attempts=6, base_delay=2):
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except HttpError as err:
+            if not _is_rate_limit_error(err) or attempt == max_attempts - 1:
+                raise
+            delay = base_delay * (2 ** attempt)
+            print(f"  Gmail rate limit hit, retrying in {delay}s (attempt {attempt + 1}/{max_attempts})...")
+            time.sleep(delay)
+
+
 def gmail_get(gmail, mid):
-    return gmail.users().messages().get(userId="me", id=mid, format="full").execute()
+    time.sleep(0.15)  # pace requests to stay under per-minute quota
+    return _with_retry(lambda: gmail.users().messages().get(userId="me", id=mid, format="full").execute())
 
 
 def gmail_get_attachment(gmail, mid, aid):
-    att = gmail.users().messages().attachments().get(userId="me", messageId=mid, id=aid).execute()
+    time.sleep(0.15)
+    att = _with_retry(lambda: gmail.users().messages().attachments().get(userId="me", messageId=mid, id=aid).execute())
     return b64url_decode(att["data"])
 
 

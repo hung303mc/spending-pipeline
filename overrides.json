@@ -33,5 +33,40 @@
     "category": "Cho mượn (loại)",
     "user_note": "Cho mượn tiền 100tr",
     "exclude": true
+  },
+  "203V009262500666": {
+    "category": "Cho mượn (loại)",
+    "user_note": "Cho mượn 5tr (note 06/09 VietinBank)",
+    "exclude": true
+  },
+  "203V009262506396": {
+    "category": "Cho mượn (loại)",
+    "user_note": "Cho mượn 2tr (07/09)",
+    "exclude": true
+  },
+  "203V60026250A4F6": {
+    "category": "Cho mượn (loại)",
+    "user_note": "Cho mượn thêm 2tr (07/09)",
+    "exclude": true
+  },
+  "203V009262542203": {
+    "category": "Cho mượn (loại)",
+    "user_note": "Cho mượn 3tr (11/09)",
+    "exclude": true
+  },
+  "203V009262580059": {
+    "category": "Cho mượn (loại)",
+    "user_note": "Cho mượn 2tr (15/09)",
+    "exclude": true
+  },
+  "203V009262716660": {
+    "category": "Cho mượn (loại)",
+    "user_note": "Cho mượn 2tr (28/09)",
+    "exclude": true
+  },
+  "203CTMB261970804": {
+    "category": "Trả nợ / Cho mượn",
+    "user_note": "Cho a Hưng mượn, đã trả lại",
+    "exclude": true
   }
 }

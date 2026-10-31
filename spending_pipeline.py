@@ -291,6 +291,33 @@ def parse_tpbank_card(text, msg_date):
     }
 
 
+def parse_binance_card(text, subject):
+    """Parse 1 Binance Card email (Transaction Successful / Reverse Successful).
+
+    Body: "You've paid 3667422 VND at CO-OP XTRA LONG BINH." hoặc
+          "You have been reversed 1000 VND from OP *Green SM."
+    Subject có giờ UTC: "... - 2026-10-31 02:37:01 (UTC)" → đổi sang giờ VN.
+    Reverse ghi số âm để bù trừ giao dịch gốc.
+    """
+    paid_m = re.search(r"You.{1,3}ve paid\s+([\d,\.]+)\s+([A-Z]{3})\s+at\s+(.+?)\.\s+If this", text, re.S)
+    rev_m = re.search(r"You have been reversed\s+([\d,\.]+)\s+([A-Z]{3})\s+from\s+(.+?)\.\s+View", text, re.S)
+    m = paid_m or rev_m
+    if not m: return None
+    a, cur, merch = m.group(1).replace(",", ""), m.group(2), " ".join(m.group(3).split())
+    amount = float(a) if cur != "VND" else int(float(a))
+    if rev_m: amount = -amount
+    time_m = re.search(r"(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}):\d{2} \(UTC\)", subject)
+    if not time_m: return None
+    vn = datetime.strptime(f"{time_m.group(1)} {time_m.group(2)}", "%Y-%m-%d %H:%M") + timedelta(hours=7)
+    return {
+        "source": "BINANCE_CARD", "card_last4": "2484",
+        "date": vn.strftime("%Y-%m-%d"), "time": vn.strftime("%H:%M"),
+        "amount": amount, "currency": cur,
+        "merchant_raw": merch,
+        "txn_type": "Reverse" if rev_m else "",
+    }
+
+
 def parse_tpbank_tktt_pdf(pdf_bytes):
     """Extract giao dịch từ sao kê TPBank TKTT PDF."""
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
@@ -351,7 +378,7 @@ RULES = [
     ("Vé giải trí / Du lịch", [r"airbnb", r"nam cat tien", r"ba den", r"leo nui", r"vincom retail", r"vé máy bay", r"vietjet", r"vietnamair", r"agoda", r"booking\.com"]),
     ("Đồ gia dụng / Điện tử", [r"imac", r"macbook", r"may loc khong khi", r"the gioi di dong", r"fpt shop", r"phong vu"]),
     ("Y tế / Kính mắt",     [r"pharmacity", r"mat hai yen", r"benh vien", r"phong kham", r"long chau", r"megane", r"matkinh", r"optic"]),
-    ("Siêu thị / Tạp hoá",  [r"king food", r"kfm_", r"kfmkp", r"co-opxtra", r"saigon co-op", r"ministop", r"fairprice", r"co\.op", r"winmart", r"bach hoa"]),
+    ("Siêu thị / Tạp hoá",  [r"king food", r"kfm_", r"kfmkp", r"co-opxtra", r"co-op xtra", r"saigon co-op", r"ministop", r"fairprice", r"co\.op", r"winmart", r"bach hoa"]),
     ("Quần áo / Thể thao",  [r"uniqlo", r"decathlon", r"hdl", r"zara", r"h&m"]),
     ("Di chuyển (Grab/Xanh)", [r"grab", r"xanhsm", r"xanh sm", r"green sm", r".op\*"]),
     ("Mua sắm online",      [r"shopee", r"etsy", r"lazada", r"tiki"]),
@@ -431,6 +458,19 @@ def fetch_month(gmail, year, month, overrides):
         txt = get_text(msg.get("payload", {}))
         rec = parse_tpbank_card(txt, f"{year}-{month:02d}-01")
         if rec: sources.append(rec)
+
+    # 3b. Binance Card (2484) — không có sao kê tháng, chỉ có mail từng giao dịch
+    q = f'from:do-not-reply@ses.binance.com subject:("Binance Card - Transaction Successful" OR "Binance Card - Transaction Reverse Successful") {gmail_range_q(start - timedelta(days=1), end + timedelta(days=1))}'
+    ids = gmail_search(gmail, q)
+    print(f"  Binance Card: {len(ids)} emails")
+    for mid in ids:
+        msg = gmail_get(gmail, mid)
+        txt = get_text(msg.get("payload", {}))
+        subj = next((h["value"] for h in msg.get("payload", {}).get("headers", [])
+                     if h["name"].lower() == "subject"), "")
+        rec = parse_binance_card(txt, subj)
+        # Query nới ±1 ngày vì subject giờ UTC; lọc lại theo ngày giờ VN
+        if rec and rec["date"].startswith(f"{year}-{month:02d}"): sources.append(rec)
 
     # 4. TPBank TKTT PDF (gửi mùng 1-5 tháng sau)
     next_start = (end + timedelta(days=1))
